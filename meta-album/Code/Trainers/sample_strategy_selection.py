@@ -51,7 +51,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument("--strategy", type=str, default="basic", required=True, help="Strategy to use for selecting training data. Default: basic.")
     parser.add_argument("--sub_strategy", type=str, default="basic", required=False, help="Strategy to use for pre-selecting data. Default: basic.")
     parser.add_argument("--trained_on_strategy", type=str, default="basic", required=True, help="Load model trained on this strategy instead. Default: basic.")
-    parser.add_argument("--selection", type=str, default="forward", required=False, help="Which selection to run")
+    parser.add_argument("--selection", type=str, default="forward", choices=['forward', 'backward', 'datamodels'] required=False, help="Which selection to run")
     
     # Optional arguments
 
@@ -832,6 +832,7 @@ class WithinDomainFewShotLearningExperiment:
             else:
                 no_change_in_results = True
                 break
+        print(f'Selected strategies: {selected_strategy}')
 
     def backward(self):
         SUB_STRATEGY = args.sub_strategy
@@ -1026,6 +1027,140 @@ class WithinDomainFewShotLearningExperiment:
             else:
                 no_change_in_results = True
                 break
+        print(f'Selected strategies: {selected_strategy}')
+
+    def datamodels(self):
+        SUB_STRATEGY = args.sub_strategy
+        seeds = [random.randint(0, 100000) for _ in range(10)]
+        if args.trained_on_strategy == 'basic':
+            model_load_path = os.path.join(self.run_test_dir, 'best-model.pkl')
+        else:
+            model_load_path = os.path.join(self.run_test_dir, f'{args.trained_on_strategy}.pkl')
+
+        model = self.model_constr(**self.conf)
+        with open(model_load_path, 'rb+') as file:
+            state = pickle.load(file)
+        model.load_state(state)
+
+        with open(os.path.join(self.data_dir, 'datamodels_strategies_to_run.pkl'), 'rb') as file:
+            STRATEGIES = pickle.load(file)
+        
+        with open(os.path.join(self.data_dir, 'basic_score.pkl'), 'rb') as file:
+            scores = pickle.load(file)
+
+        datamodels_data = []
+
+        for strategy in STRATEGIES:
+            if type(strategy) == list:
+                strategy = '_'.join(strategy)
+            if SUB_STRATEGY in strategy and strategy != 'basic':
+                continue
+            num_runs = 10
+
+            scores_to_average = []
+
+            for run in range(num_runs):
+                if strategy == 'basic':
+                    self.set_seed(seeds[run])
+                else:
+                    self.set_seed()
+
+                if args.trained_on_strategy == 'basic':
+                    if SUB_STRATEGY == 'basic':
+                        save_path = os.path.join(self.run_test_dir, strategy)
+                    else:
+                        save_path = os.path.join(self.run_test_dir, strategy, SUB_STRATEGY)
+                else:
+                    save_path = os.path.join(self.run_test_dir, 'pretrained', args.trained_on_strategy, strategy)
+                if not os.path.exists(save_path):
+                    os.makedirs(save_path)
+                
+                if os.path.exists(os.path.join(save_path, f'{strategy}_selection_test_scores.csv')):
+                    already_run_tests = pd.read_csv(os.path.join(save_path, f'{strategy}_selection_test_scores.csv'))
+                    if run < already_run_tests.shape[0]:
+                        print(f'Run {run} for strategy {strategy} and model {self.args.model} is already done. Skipping!')
+                        continue
+                
+
+                test_results_file = os.path.join(save_path, f'{strategy}_selection_results_test_{run}.csv')
+                with open(test_results_file, "w+", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Accuracy", "Loss"])
+                    
+                test_predictions_file  = os.path.join(save_path, f'{strategy}_selection_predictions_test{run}.csv')
+                with open(test_predictions_file, "w+", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(["Label", "Prediction", "Probabilities"])
+
+                test_accuracies = list()
+                self.clprint("\n[*] Evaluation...")
+                n_way = self.args.N
+                k_shot = self.args.k_train
+                query_size = self.args.k_test
+                support_size = n_way * k_shot
+
+                (label_col, file_col, img_path, md_path) = extract_info(self.data_dir, self.args.dataset)
+                train_path, valid_path, test_path = extract_train_valid_test_info(self.data_dir, self.args.dataset)
+                train_path = extract_strategy_samples_info(self.data_dir, self.args.dataset, strategy, run, SUB_STRATEGY)
+                print(f'Loading from {train_path}')
+                dataset = TestFewshotDataset(img_path, train_path, test_path, label_col, file_col)
+                sampler = TestCategoriesSampler(dataset.support_labels, dataset.query_labels, self.args.eval_iters, n_way, k_shot, query_size)
+                loader = iter(self.cycle(DataLoader(dataset=dataset, batch_sampler=sampler, num_workers=1, pin_memory=True)))
+
+                for i, task in enumerate(loader):
+                    ttime = time.time()
+                    data, labels = task
+                    labels = process_labels(n_way * (k_shot + query_size), n_way)
+                    train_x, train_y, test_x, test_y = (data[:support_size], labels[:support_size], data[support_size:], labels[support_size:])
+
+                    acc, loss_history, probs, preds = model.evaluate(None, train_x, train_y, test_x, test_y, val=False)
+
+                    self.clprint(f"Iteration: {i+1}\tTest loss: {loss_history[-1]:.4f}\tTest acc: {acc:.4f}\tTest time: {time.time() - ttime} seconds") 
+                        
+                    with open(test_results_file, "a", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow([acc, loss_history[-1]])
+                            
+                    with open(test_predictions_file, "a", newline="") as f:
+                        labels = test_y.cpu().numpy()
+                        writer = csv.writer(f)
+                        for j in range(len(labels)):
+                            writer.writerow([labels[j], preds[j], list(probs[j])])
+                        
+                    test_accuracies.append(acc)
+                    if (i+1) == self.args.eval_iters:
+                        break  
+                        
+                # Store test scores
+                test_scores_file = os.path.join(save_path, f'{strategy}_selection_test_scores.csv')
+                score_name = "accuracy"
+                if run == 0:
+                    with open(test_scores_file, "w+", newline="") as f:
+                        writer = csv.writer(f)
+                        writer.writerow(["run", f"mean_{score_name}", f"median_{score_name}", "95ci", "time"])
+                    
+                r, mean, median = (str(0), str(np.mean(test_accuracies)), str(np.median(test_accuracies)))
+                lb, _ = st.t.interval(alpha=0.95, df=len(test_accuracies)-1, loc=np.mean(test_accuracies), scale=st.sem(test_accuracies)) 
+                conf_interval = str(np.mean(test_accuracies) - lb)
+                with open(test_scores_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow([r, mean, median, conf_interval, ttime])
+                
+                scores_to_average.append(mean)
+
+                self.clprint(f"\nRun {run} done, mean {score_name}: {mean}, median {score_name}: {median}, 95ci: {conf_interval}, time(s): {ttime}")
+                self.clprint("-"*40)
+            
+            final_score = np.mean(scores_to_average)
+            datamodels_data.append({
+                'strategy': STRATEGIES,
+                'acc': final_score,
+                'diff_basic': final_score - scores['basic'],
+                'diff_random': final_score - scores['random'],
+            })
+        pd.DataFrame(datamodels_data).to_csv(os.path.join(self.data_dir, f'{self.args.model}.csv'))
+
+
 
 if __name__ == "__main__":
     # Get args 
@@ -1040,9 +1175,14 @@ if __name__ == "__main__":
     
     print(args.run_only_test)
     # Run experiment
+    EXPERIMENT_RUN_MAPPING = {
+        'forward': experiment.forward,
+        'backward': experiment.backward,
+        'datamodels': experiment.datamodels,
+    }
     if args.run_only_test == 1:
         print('Running only test')
-        experiment.forward() if args.selection == 'forward' else experiment.backward()
+        EXPERIMENT_RUN_MAPPING[args.selection]()
     else:
         print('Running full training')
         experiment.run()
